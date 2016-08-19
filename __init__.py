@@ -1,35 +1,47 @@
 import numpy as np
 
 
+pi_over_180 = np.pi / 180.
+
 try:
     import numba
-    
+
     @numba.njit
     def _to_spherical(lat, lon, a, b, c):
         """Convert degrees latitude/longitude to coordinates on an ellipsoid.
         
         About ~25% Faster than the numpy version (useful for big arrays).
         """
-        x_y_z = np.zeros(lat.shape + (3,))
+        x_y_z = np.empty(lat.shape + (3,))
+        
         for idx in np.ndindex(lat.shape):
+            
             xyz = x_y_z[idx]
-            la = lat[idx] * (np.pi / 180.)
-            lo = lon[idx] * (np.pi / 180.)
+            
+            la = lat[idx] * pi_over_180
+            lo = lon[idx] * pi_over_180
+            
             cos_la = np.cos(la)
-            xyz[0] = a * cos_la * la
-            xyz[1] = b * cos_la * np.sin(lo)
-            xyz[2] = c * np.sin(la)
+            
+            xyz[0] = a * cos_la * np.cos(lo)
+            xyz[1] = b * np.sin(la)
+            xyz[2] = c * cos_la * np.sin(lo)
+        
         return x_y_z
 
 except ImportError:
     
     def _to_spherical(lat, lon, a, b, c):
-        la = (np.pi / 180) * lat
-        lo = (np.pi / 180) * lon
+        
+        la = pi_over_180 * lat
+        lo = pi_over_180 * lon
         cos_la = np.cos(la)
-        x = a * cos_la * la
-        y = b * cos_la * np.sin(lo)
-        z = c * np.sin(la)
+        
+        x = a * cos_la * np.cos(lo)
+        y = b * np.sin(la) # Y is the polar axis
+        z = c * cos_la * np.sin(lo)
+        
+        del cos_la
         return np.concatenate((x[...,None],
                                y[...,None],
                                z[...,None]), axis=-1).shape
@@ -50,14 +62,40 @@ def to_spherical(lat, lon, ellipsoid=None):
             half-length of the axes along each dimension can provided
             in a tuple of floats. The default value for ellipsoid is 
             None, in which case it defaults to the unit sphere.
+            
+            If axis radii are supplied, they should be in the form a, b, c.
+            If only two axis radii are supplied, then c will be defined as c=a.
+            This covers the typical case of the Earth ellipsoid where the x and z
+            axes have the same radii, but the y (polar) axis differs.
     
     Note:
-        x and y are coordinates along the equatorial plane.
-        Results are only valid for -90<lat<90 and -180<lon<180.
+        The spherical coordinates will be returned in the form of coordinates 
+        along orthogonal axes (x, y, z).
+        
+        The x axis is the vector from the center of the ellipsoid (C) to the
+        point on the surface at (lat=0.0, lon=0.0). Equivalently, the negative
+        x direction lies along the vector from C to (lat=0.0, lon= +/-180).
+        
+        The positive y direction is the vector from C to the point on the surface
+        at (lat=90, lon=?). The negative y direction is the vector from C to
+        (lat=90, lon=?). Therefore 'North' means positive y and 'South' means
+        negative y. The z axis runs from (lat=0, lon=90) (positive z) to
+        (lat=0, lon=-90) (negative z).
+        
+        Simply put: x and z are coordinates along the equatorial plane. y are
+        coordinates along the polar axis. Usually the radii of the x and z axes
+        are equal (as in the case of the Earth).
+        
+        Results are only valid for -90<lat<90 and -180<lon<180. Values outside
+        of this range will be 'wrapped' into this range.
+        
     
     References:
         <https://en.wikipedia.org/wiki/Ellipsoid>
     """
+    
+    lat, lon = np.array(lat), np.array(lon)
+    
     if ellipsoid is None:
         # Put points onto a unit sphere
         a = b = c = 1.0
@@ -66,11 +104,14 @@ def to_spherical(lat, lon, ellipsoid=None):
         a = b = c = 6371007.181000 # meters
     
     elif ellipsoid in {'WGS84', 'wgs84'}:
-        a, c =  6378137.0, 6356752.314245 # meters
-        b = a
+        a = c = 6378137.0  # meters (from Wikipedia)
+        b = 6356752.3142
     
-    elif np.isscalar(ellipsoid) or len(ellipsoid) is 1:
+    elif np.isscalar(ellipsoid):
         a = b = c = ellipsoid
+    
+    elif len(ellipsoid) is 1:
+        a = b = c = ellipsoid[0]
     
     elif len(ellipsoid) is 2:
         a, b = ellipsoid
@@ -96,7 +137,7 @@ class GeoTree:
             lat - numpy.array(shape=S)
                 A grid of longitude values that we want to sample *TO*.
             
-            ellipsoid - [None] | "WGS84" | "SPHERE" | sequence of axis half-lengths
+            ellipsoid - [None] | "WGS84" | "SPHERE" | sequence of major / minor axis radii
                 Specifies the shape of the Earth/sphere/geoid that the lat, lon
                 values are mapped on.
             
@@ -121,9 +162,11 @@ class GeoTree:
         # Convert lat and lon to flattened views
         xyz = to_spherical(np.ravel(lat), np.ravel(lon), ellipsoid=ellipsoid)
         
+        # Build the KDTree
         self.tree = scipy.spatial.cKDTree(xyz, leafsize=leafsize,
                                           compact_nodes=compact_nodes, 
                                           balanced_tree=balanced_tree)
+    
     
     def query(self, lat, lon, ellipsoid=None, **kwargs):
         """Find the closest ref coord to each of the query coords.
@@ -177,8 +220,6 @@ class GeoTree:
             [2] tuple(numpy.array(shape=(V,), dtype=int))
                 The distance from each valid query point to the closest ref
                 point.
-                
-            
         """
         ellipsoid = ellipsoid or self.ellipsoid
         lat, lon = np.array(lat), np.array(lon)
@@ -200,4 +241,7 @@ class GeoTree:
         # Convert to indices of the lat/lon grid it was constructed with
         indices = np.unravel_index(indices, self.S)
         return distances.reshape(T), tuple(idx.reshape(T) for idx in indices)
-
+    
+    def __call__(self, lat, lon, ellipsoid=None, **kwargs):
+        """Can 'query' by calling the GeoTree."""
+        return self.query(lat, lon, ellipsoid, **kwargs)
